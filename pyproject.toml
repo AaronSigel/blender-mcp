@@ -15,8 +15,17 @@ classifiers = [
 ]
 dependencies = [
     "mcp[cli]>=1.3.0",
+]
+
+# BMA_PATCH: asset-integration deps are optional — server runs in benchmark
+# mode without them. Install the 'telemetry' extra to enable usage reporting.
+[project.optional-dependencies]
+telemetry = [
     "supabase>=2.0.0",
     "tomli>=2.0.0",
+]
+full = [
+    "blender-mcp[telemetry]",
 ]
 
 [project.scripts]
@@ -32,3 +41,11 @@ package-dir = {"" = "src"}
 [project.urls]
 "Homepage" = "https://github.com/yourusername/blender-mcp"
 "Bug Tracker" = "https://github.com/yourusername/blender-mcp/issues"
+
+# BMA_PATCH: pytest configuration — run without -m mcp to skip real-server tests.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "mcp: tests requiring a running MCP server / Blender with blender-mcp addon",
+]

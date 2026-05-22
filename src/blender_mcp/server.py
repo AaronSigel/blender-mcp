@@ -10,12 +10,44 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
 import os
 from pathlib import Path
-import base64
-from urllib.parse import urlparse
 
-# Import telemetry
-from .telemetry import record_startup, get_telemetry
-from .telemetry_decorator import telemetry_tool
+# BMA_PATCH: lazy import telemetry so the server starts without optional deps
+# (supabase, tomli). Falls back to no-op decorator when unavailable.
+try:
+    from .telemetry_decorator import telemetry_tool as _telemetry_tool_impl
+except Exception:  # ImportError or any dep chain failure
+    _telemetry_tool_impl = None
+
+if _telemetry_tool_impl is not None:
+    telemetry_tool = _telemetry_tool_impl
+else:
+    import functools as _ft_noop
+    def telemetry_tool(name: str):  # type: ignore[misc]
+        """No-op fallback when telemetry deps are unavailable."""
+        def _dec(func):
+            @_ft_noop.wraps(func)
+            def _wrap(*a, **kw):
+                return func(*a, **kw)
+            return _wrap
+        return _dec
+# BMA_PATCH: tool-gating
+import functools as _functools
+from .tool_profiles import get_profile as _bma_get_profile, is_tool_enabled as _bma_is_tool_enabled
+
+def _bma_gated(tool_name: str):
+    """Decorator: raise if tool is disabled by the active BMA profile."""
+    def _decorator(func):
+        @_functools.wraps(func)
+        def _wrapper(*args, **kwargs):
+            _profile = _bma_get_profile()
+            if not _bma_is_tool_enabled(tool_name, _profile):
+                raise RuntimeError(
+                    f"Tool '{tool_name}' is disabled by benchmark profile '{_profile.name}'."
+                )
+            return func(*args, **kwargs)
+        return _wrapper
+    return _decorator
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -180,6 +212,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 
         # Record startup event for telemetry
         try:
+            from .telemetry import record_startup  # BMA_PATCH: lazy import
             record_startup()
         except Exception as e:
             logger.debug(f"Failed to record startup telemetry: {e}")
@@ -214,26 +247,23 @@ mcp = FastMCP(
 
 # Global connection for resources (since resources can't access context)
 _blender_connection = None
-_polyhaven_enabled = False  # Add this global variable
 
 def get_blender_connection():
-    """Get or create a persistent Blender connection"""
-    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
-    
-    # If we have an existing connection, check if it's still valid
+    """Get or create a persistent Blender connection."""
+    # BMA_PATCH: removed _polyhaven_enabled health-check ping (asset integration,
+    # not needed in benchmark mode and blocked by gating for safe profiles).
+    global _blender_connection
+
+    # If we have an existing connection, verify it with a lightweight ping
     if _blender_connection is not None:
         try:
-            # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
-            # Store the PolyHaven status globally
-            _polyhaven_enabled = result.get("enabled", False)
+            _blender_connection.send_command("get_scene_info")
             return _blender_connection
         except Exception as e:
-            # Connection is dead, close it and create a new one
             logger.warning(f"Existing connection is no longer valid: {str(e)}")
             try:
                 _blender_connection.disconnect()
-            except:
+            except Exception:
                 pass
             _blender_connection = None
     
@@ -251,7 +281,300 @@ def get_blender_connection():
     return _blender_connection
 
 
+# ---------------------------------------------------------------------------
+# BMA_PATCH: benchmark-meta and benchmark-safe tools (tasks 5.18, 5.19)
+# ---------------------------------------------------------------------------
+
+@_bma_gated("get_bma_profile_info")  # BMA_PATCH
+@mcp.tool()
+def get_bma_profile_info(ctx: Context) -> str:
+    """Return the active BMA benchmark profile and the tool allow/deny lists."""
+    from .tool_profiles import (
+        get_profile as _tp_get_profile,
+        get_enabled_tools,
+        get_disabled_tools,
+        is_python_allowed,
+        is_external_asset_allowed,
+    )
+    from .bma_env import is_external_assets_enabled, is_python_execution_allowed
+    import os as _os
+
+    profile = _tp_get_profile()
+    telemetry_disabled = _os.environ.get("BMA_ENABLE_TELEMETRY", "false").lower() not in ("1", "true", "yes")
+    result = {
+        "active_profile": profile.name,
+        "enabled_tools": sorted(get_enabled_tools(profile)),
+        "disabled_tools": sorted(get_disabled_tools(profile)),
+        "allow_python_execution": is_python_allowed(profile),
+        "allow_external_assets": is_external_asset_allowed(profile),
+        "telemetry_disabled": telemetry_disabled,
+    }
+    return json.dumps(result, indent=2)
+
+
+def _bma_json(tool: str, result=None, error: Exception | None = None) -> str:
+    payload = {
+        "ok": error is None,
+        "tool": tool,
+        "result": result if error is None else None,
+        "error": None if error is None else {
+            "type": type(error).__name__,
+            "message": str(error),
+        },
+    }
+    return json.dumps(payload, indent=2)
+
+
+@_bma_gated("bma_get_scene_info")  # BMA_PATCH
+@mcp.tool()
+def bma_get_scene_info(ctx: Context) -> str:
+    """Return scene info as strict JSON without arbitrary Python. Safe in minimal/no_python."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_scene_info")
+        return _bma_json("bma_get_scene_info", result=result)
+    except Exception as e:
+        return _bma_json("bma_get_scene_info", error=e)
+
+
+@_bma_gated("bma_create_object")  # BMA_PATCH
+@mcp.tool()
+def bma_create_object(
+    ctx: Context,
+    type: str,
+    name: str = "",
+    location: list[float] | None = None,
+    rotation: list[float] | None = None,
+    scale: list[float] | None = None,
+    dimensions: list[float] | None = None,
+) -> str:
+    """Create a primitive object. type: MESH_CUBE|MESH_SPHERE|MESH_CYLINDER|MESH_PLANE|MESH_CONE|EMPTY."""
+    try:
+        blender = get_blender_connection()
+        params: dict = {"type": type}
+        if name:
+            params["name"] = name
+        if location:
+            params["location"] = location
+        if rotation:
+            params["rotation"] = rotation
+        if scale:
+            params["scale"] = scale
+        if dimensions:
+            params["dimensions"] = dimensions
+        result = blender.send_command("create_object", params)
+        return _bma_json("bma_create_object", result=result)
+    except Exception as e:
+        return _bma_json("bma_create_object", error=e)
+
+
+@_bma_gated("bma_set_transform")  # BMA_PATCH
+@mcp.tool()
+def bma_set_transform(
+    ctx: Context,
+    object_name: str,
+    location: list[float] | None = None,
+    rotation: list[float] | None = None,
+    scale: list[float] | None = None,
+    dimensions: list[float] | None = None,
+) -> str:
+    """Set location/rotation/scale/dimensions of a named object using strict JSON params."""
+    try:
+        blender = get_blender_connection()
+        params: dict = {"object_name": object_name}
+        if location is not None:
+            params["location"] = location
+        if rotation is not None:
+            params["rotation"] = rotation
+        if scale is not None:
+            params["scale"] = scale
+        if dimensions is not None:
+            params["dimensions"] = dimensions
+        result = blender.send_command("set_transform", params)
+        return _bma_json("bma_set_transform", result=result)
+    except Exception as e:
+        return _bma_json("bma_set_transform", error=e)
+
+
+@_bma_gated("bma_set_material")  # BMA_PATCH
+@mcp.tool()
+def bma_set_material(
+    ctx: Context,
+    object_name: str,
+    color: list[float] | None = None,
+    metallic: float = 0.0,
+    roughness: float = 0.5,
+    material_name: str | None = None,
+    base_color: list[float] | None = None,
+    create_if_missing: bool = True,
+) -> str:
+    """Assign a simple BSDF material (RGBA color + metallic/roughness) to an object."""
+    try:
+        blender = get_blender_connection()
+        params = {
+            "object_name": object_name,
+            "color": color,
+            "base_color": base_color,
+            "metallic": metallic,
+            "roughness": roughness,
+            "create_if_missing": create_if_missing,
+        }
+        if material_name:
+            params["material_name"] = material_name
+        result = blender.send_command("set_material", params)
+        return _bma_json("bma_set_material", result=result)
+    except Exception as e:
+        return _bma_json("bma_set_material", error=e)
+
+
+@_bma_gated("bma_assign_material")  # BMA_PATCH
+@mcp.tool()
+def bma_assign_material(
+    ctx: Context,
+    object_name: str,
+    material_name: str | None = None,
+    base_color: list[float] | None = None,
+    color: list[float] | None = None,
+    roughness: float = 0.5,
+    metallic: float = 0.0,
+    create_if_missing: bool = True,
+) -> str:
+    """Create/update and assign a material to an object in one benchmark-safe action."""
+    try:
+        blender = get_blender_connection()
+        params: dict = {
+            "object_name": object_name,
+            "color": color,
+            "base_color": base_color,
+            "metallic": metallic,
+            "roughness": roughness,
+            "create_if_missing": create_if_missing,
+        }
+        if material_name:
+            params["material_name"] = material_name
+        result = blender.send_command("set_material", params)
+        return _bma_json("bma_assign_material", result=result)
+    except Exception as e:
+        return _bma_json("bma_assign_material", error=e)
+
+
+@_bma_gated("bma_create_light")  # BMA_PATCH
+@mcp.tool()
+def bma_create_light(
+    ctx: Context,
+    type: str,
+    name: str = "",
+    location: list[float] | None = None,
+    rotation: list[float] | None = None,
+    energy: float = 1000.0,
+    color: list[float] | None = None,
+) -> str:
+    """Create a light. type: POINT|SUN|SPOT|AREA."""
+    try:
+        blender = get_blender_connection()
+        params: dict = {"type": type, "energy": energy}
+        if name:
+            params["name"] = name
+        if location:
+            params["location"] = location
+        if rotation:
+            params["rotation"] = rotation
+        if color:
+            params["color"] = color
+        result = blender.send_command("create_light", params)
+        return _bma_json("bma_create_light", result=result)
+    except Exception as e:
+        return _bma_json("bma_create_light", error=e)
+
+
+@_bma_gated("bma_create_camera")  # BMA_PATCH
+@mcp.tool()
+def bma_create_camera(
+    ctx: Context,
+    name: str = "Camera",
+    location: list[float] | None = None,
+    rotation: list[float] | None = None,
+    lens: float = 50.0,
+    target: list[float] | None = None,
+    focal_length: float | None = None,
+    make_active: bool = True,
+) -> str:
+    """Create a camera object with optional lens focal length (mm)."""
+    try:
+        blender = get_blender_connection()
+        params: dict = {"name": name, "lens": lens, "make_active": make_active}
+        if focal_length is not None:
+            params["focal_length"] = focal_length
+        if location:
+            params["location"] = location
+        if target:
+            params["target"] = target
+        if rotation:
+            params["rotation"] = rotation
+        result = blender.send_command("create_camera", params)
+        return _bma_json("bma_create_camera", result=result)
+    except Exception as e:
+        return _bma_json("bma_create_camera", error=e)
+
+
+@_bma_gated("bma_create_camera_look_at")  # BMA_PATCH
+@mcp.tool()
+def bma_create_camera_look_at(
+    ctx: Context,
+    name: str,
+    location: list[float],
+    target: list[float],
+    focal_length: float = 35.0,
+    make_active: bool = True,
+    sensor_width: float | None = None,
+    clip_start: float | None = None,
+    clip_end: float | None = None,
+) -> str:
+    """Create a camera and orient it toward a target point using Blender look-at logic."""
+    try:
+        blender = get_blender_connection()
+        params: dict = {
+            "name": name,
+            "location": location,
+            "target": target,
+            "focal_length": focal_length,
+            "make_active": make_active,
+        }
+        if sensor_width is not None:
+            params["sensor_width"] = sensor_width
+        if clip_start is not None:
+            params["clip_start"] = clip_start
+        if clip_end is not None:
+            params["clip_end"] = clip_end
+        result = blender.send_command("create_camera_look_at", params)
+        return _bma_json("bma_create_camera_look_at", result=result)
+    except Exception as e:
+        return _bma_json("bma_create_camera_look_at", error=e)
+
+
+@_bma_gated("bma_export_scene")  # BMA_PATCH
+@mcp.tool()
+def bma_export_scene(
+    ctx: Context,
+    filepath: str,
+    format: str = "GLB",
+) -> str:
+    """Export the current scene. format: GLB|GLTF|OBJ|FBX|USD."""
+    try:
+        blender = get_blender_connection()
+        params = {"filepath": filepath, "format": format}
+        result = blender.send_command("export_scene", params)
+        return _bma_json("bma_export_scene", result=result)
+    except Exception as e:
+        return _bma_json("bma_export_scene", error=e)
+
+
+# ---------------------------------------------------------------------------
+# Upstream tools (proxied through blender-mcp)
+# ---------------------------------------------------------------------------
+
 @telemetry_tool("get_scene_info")
+@_bma_gated("get_scene_info")  # BMA_PATCH
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
     """Get detailed information about the current Blender scene"""
@@ -266,6 +589,7 @@ def get_scene_info(ctx: Context) -> str:
         return f"Error getting scene info: {str(e)}"
 
 @telemetry_tool("get_object_info")
+@_bma_gated("get_object_info")  # BMA_PATCH
 @mcp.tool()
 def get_object_info(ctx: Context, object_name: str) -> str:
     """
@@ -285,6 +609,7 @@ def get_object_info(ctx: Context, object_name: str) -> str:
         return f"Error getting object info: {str(e)}"
 
 @telemetry_tool("get_viewport_screenshot")
+@_bma_gated("get_viewport_screenshot")  # BMA_PATCH
 @mcp.tool()
 def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
     """
@@ -329,6 +654,7 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
 
 
 @telemetry_tool("execute_blender_code")
+@_bma_gated("execute_blender_code")  # BMA_PATCH
 @mcp.tool()
 def execute_blender_code(ctx: Context, code: str) -> str:
     """
@@ -347,6 +673,7 @@ def execute_blender_code(ctx: Context, code: str) -> str:
         return f"Error executing code: {str(e)}"
 
 @telemetry_tool("get_polyhaven_categories")
+@_bma_gated("get_polyhaven_categories")  # BMA_PATCH
 @mcp.tool()
 def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
     """
@@ -357,8 +684,6 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
     """
     try:
         blender = get_blender_connection()
-        if not _polyhaven_enabled:
-            return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
         result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
         
         if "error" in result:
@@ -380,6 +705,7 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
         return f"Error getting Polyhaven categories: {str(e)}"
 
 @telemetry_tool("search_polyhaven_assets")
+@_bma_gated("search_polyhaven_assets")  # BMA_PATCH
 @mcp.tool()
 def search_polyhaven_assets(
     ctx: Context,
@@ -430,6 +756,7 @@ def search_polyhaven_assets(
         return f"Error searching Polyhaven assets: {str(e)}"
 
 @telemetry_tool("download_polyhaven_asset")
+@_bma_gated("download_polyhaven_asset")  # BMA_PATCH
 @mcp.tool()
 def download_polyhaven_asset(
     ctx: Context,
@@ -482,6 +809,7 @@ def download_polyhaven_asset(
         return f"Error downloading Polyhaven asset: {str(e)}"
 
 @telemetry_tool("set_texture")
+@_bma_gated("set_texture")  # BMA_PATCH
 @mcp.tool()
 def set_texture(
     ctx: Context,
@@ -542,6 +870,7 @@ def set_texture(
         return f"Error applying texture: {str(e)}"
 
 @telemetry_tool("get_polyhaven_status")
+@_bma_gated("get_polyhaven_status")  # BMA_PATCH
 @mcp.tool()
 def get_polyhaven_status(ctx: Context) -> str:
     """
@@ -561,6 +890,7 @@ def get_polyhaven_status(ctx: Context) -> str:
         return f"Error checking PolyHaven status: {str(e)}"
 
 @telemetry_tool("get_hyper3d_status")
+@_bma_gated("get_hyper3d_status")  # BMA_PATCH
 @mcp.tool()
 def get_hyper3d_status(ctx: Context) -> str:
     """
@@ -582,6 +912,7 @@ def get_hyper3d_status(ctx: Context) -> str:
         return f"Error checking Hyper3D status: {str(e)}"
 
 @telemetry_tool("get_sketchfab_status")
+@_bma_gated("get_sketchfab_status")  # BMA_PATCH
 @mcp.tool()
 def get_sketchfab_status(ctx: Context) -> str:
     """
@@ -601,6 +932,7 @@ def get_sketchfab_status(ctx: Context) -> str:
         return f"Error checking Sketchfab status: {str(e)}"
 
 @telemetry_tool("search_sketchfab_models")
+@_bma_gated("search_sketchfab_models")  # BMA_PATCH
 @mcp.tool()
 def search_sketchfab_models(
     ctx: Context,
@@ -678,6 +1010,7 @@ def search_sketchfab_models(
         return f"Error searching Sketchfab models: {str(e)}"
 
 @telemetry_tool("download_sketchfab_model")
+@_bma_gated("download_sketchfab_model")  # BMA_PATCH
 @mcp.tool()
 def get_sketchfab_model_preview(
     ctx: Context,
@@ -705,6 +1038,7 @@ def get_sketchfab_model_preview(
             raise Exception(result["error"])
         
         # Decode base64 image data
+        import base64  # BMA_PATCH: lazy import (asset integration only)
         image_data = base64.b64decode(result["image_data"])
         img_format = result.get("format", "jpeg")
         
@@ -720,6 +1054,7 @@ def get_sketchfab_model_preview(
         raise Exception(f"Failed to get preview: {str(e)}")
 
 
+@_bma_gated("download_sketchfab_model")  # BMA_PATCH
 @mcp.tool()
 def download_sketchfab_model(
     ctx: Context,
@@ -803,6 +1138,7 @@ def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | 
     return [int(float(i) / max(original_bbox) * 100) for i in original_bbox] if original_bbox else None
 
 @telemetry_tool("generate_hyper3d_model_via_text")
+@_bma_gated("generate_hyper3d_model_via_text")  # BMA_PATCH
 @mcp.tool()
 def generate_hyper3d_model_via_text(
     ctx: Context,
@@ -840,6 +1176,7 @@ def generate_hyper3d_model_via_text(
         return f"Error generating Hyper3D task: {str(e)}"
 
 @telemetry_tool("generate_hyper3d_model_via_images")
+@_bma_gated("generate_hyper3d_model_via_images")  # BMA_PATCH
 @mcp.tool()
 def generate_hyper3d_model_via_images(
     ctx: Context,
@@ -871,9 +1208,10 @@ def generate_hyper3d_model_via_images(
         for path in input_image_paths:
             with open(path, "rb") as f:
                 images.append(
-                    (Path(path).suffix, base64.b64encode(f.read()).decode("ascii"))
+                    (Path(path).suffix, __import__('base64').b64encode(f.read()).decode("ascii"))
                 )
     elif input_image_urls is not None:
+        from urllib.parse import urlparse  # BMA_PATCH: lazy import (asset integration only)
         if not all(urlparse(i) for i in input_image_paths):
             return "Error: not all image URLs are valid!"
         images = input_image_urls.copy()
@@ -897,6 +1235,7 @@ def generate_hyper3d_model_via_images(
         return f"Error generating Hyper3D task: {str(e)}"
 
 @telemetry_tool("poll_rodin_job_status")
+@_bma_gated("poll_rodin_job_status")  # BMA_PATCH
 @mcp.tool()
 def poll_rodin_job_status(
     ctx: Context,
@@ -941,6 +1280,7 @@ def poll_rodin_job_status(
         return f"Error generating Hyper3D task: {str(e)}"
 
 @telemetry_tool("import_generated_asset")
+@_bma_gated("import_generated_asset")  # BMA_PATCH
 @mcp.tool()
 def import_generated_asset(
     ctx: Context,
@@ -974,6 +1314,7 @@ def import_generated_asset(
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
 
+@_bma_gated("get_hunyuan3d_status")  # BMA_PATCH
 @mcp.tool()
 def get_hunyuan3d_status(ctx: Context) -> str:
     """
@@ -991,6 +1332,7 @@ def get_hunyuan3d_status(ctx: Context) -> str:
         logger.error(f"Error checking Hunyuan3D status: {str(e)}")
         return f"Error checking Hunyuan3D status: {str(e)}"
     
+@_bma_gated("generate_hunyuan3d_model")  # BMA_PATCH
 @mcp.tool()
 def generate_hunyuan3d_model(
     ctx: Context,
@@ -1028,6 +1370,7 @@ def generate_hunyuan3d_model(
         logger.error(f"Error generating Hunyuan3D task: {str(e)}")
         return f"Error generating Hunyuan3D task: {str(e)}"
     
+@_bma_gated("poll_hunyuan_job_status")  # BMA_PATCH
 @mcp.tool()
 def poll_hunyuan_job_status(
     ctx: Context,
@@ -1057,6 +1400,7 @@ def poll_hunyuan_job_status(
         logger.error(f"Error generating Hunyuan3D task: {str(e)}")
         return f"Error generating Hunyuan3D task: {str(e)}"
 
+@_bma_gated("import_generated_asset_hunyuan")  # BMA_PATCH
 @mcp.tool()
 def import_generated_asset_hunyuan(
     ctx: Context,
